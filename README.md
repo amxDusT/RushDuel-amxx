@@ -3,14 +3,12 @@ Rush Duel for knife
 
 # SQL Doesn't work yet.
 # Unfinished yet. Use at own risk.
-To Finish:
- - block rush first seconds of new round
- - add cvar to block round end in case a duel isn't over or to stop duel in case round is over.
- - 
+ 
  
 Version 2.0.
 - Rewritten completely and added rounds. 
 - added rush_health_slash, rush_health_stab, rush_health_both cvars to control HP during these modes
+- added rush_save_health, rush_save_pos: return after a duel with same hp as you had before it and in the same place?
 - added rush_rounds cvar to choose how many rounds to play
 - rush_alive cvar:
   - if 0, revives who made most kills. In case of draw, both revive.
