@@ -8,8 +8,9 @@
 #include < xs >
 
 
-//#define TEAM_PLUGIN         // if you have teamprotection plugin
-//#define SQL               // if you want to have a ranking system through sql
+//#define TEAM_PLUGIN           // if you have teamprotection plugin
+#define SQL                   // if you want to have a ranking system through sql
+
 
 #define ADMIN_FLAG          ADMIN_LEVEL_A
 #define PREFIX              "^3[RUSH]^1"
@@ -44,28 +45,28 @@ new const TOTAL = 2;
 new const SPRITE_BEAM[] = "sprites/laserbeam.spr";
 
 #if defined SQL
-new const host[] = "127.0.0.1";
-new const user[] = "root";
-new const pass[] = "";
-new const db[]   = "mysql_dust";
+    new const host[] = "127.0.0.1";
+    new const user[] = "root";
+    new const pass[] = "";
+    new const db[]   = "mysql_dust";
 
-new g_total;
-new Handle:g_Tuple;
-new bool:b_ResetRanks;
+    new gSqlTotal;
+    new Handle:tuple;
+    new bool:bResetRanks;
 
-enum _:taskData
-{
-    PINDB   = 0,
-    PDUELS,
-    PWON,
-    PLOST,
-    PWON1,
-    PWON2,
-    PWON3,
-    PRANK
-}
+    enum _:taskData
+    {
+        PINDB   = 0,
+        PDUELS,
+        PWON,
+        PLOST,
+        PWON1,
+        PWON2,
+        PWON3,
+        PRANK
+    }
 
-new g_pInfo[ MAX_PLAYERS + 1 ][ taskData ];
+    new g_SqlInfo[ MAX_PLAYERS + 1 ][ taskData ];
 #endif
 
 #if AMXX_VERSION_NUM < 183
@@ -110,6 +111,7 @@ new bIsOver;
 new bIsInRush, bCanRun;
 new g_RushInfo[ MAX_ZONES ][ rushData ]; 
 new g_Rounds[ MAX_ZONES ][ 3 ];
+
 new Float:g_HealthCache[ MAX_ZONES ][ 2 ];
 new bIsZoneBusy;
 
@@ -118,7 +120,7 @@ new editor, edit_zone;
 
 new Float:g_vecOrigin[ MAX_ZONES ][ 2 ][ 3 ];
 new Float:g_Velocity [ MAX_ZONES ][ 2 ][ 3 ];
-
+new Float:g_Position [ MAX_ZONES ][ 2 ][ 3 ];
 new const DisableAccess = ( 1 << 26 );
 
 new HamHook:PostKilled;
@@ -132,6 +134,8 @@ new OrpheuStruct:ppmove;
 new Float:pHealth[ attType ];
 new pRounds;
 new pAlive;
+new pSavePos;
+new pSaveHealth;
 
 public plugin_init()
 {
@@ -144,11 +148,14 @@ public plugin_init()
     register_clcmd( "say /rush", "CmdRush" );
     register_clcmd( "say /stop", "CmdStopDuel" );
 
-    bind_pcvar_float( create_cvar( "rush_health_slash", "1" ), Float:pHealth[ SLASH ] );
-    bind_pcvar_float( create_cvar( "rush_health_stab",  "35"), Float:pHealth[ STAB ]  );
-    bind_pcvar_float( create_cvar( "rush_health_both",  "35"), Float:pHealth[ BOTH ]  );
+    bind_pcvar_float( create_cvar( "rush_health_slash", "1"  ), Float:pHealth[ SLASH ] );
+    bind_pcvar_float( create_cvar( "rush_health_stab",  "35" ), Float:pHealth[ STAB ]  );
+    bind_pcvar_float( create_cvar( "rush_health_both",  "35" ), Float:pHealth[ BOTH ]  );
+    
+    bind_pcvar_num( create_cvar( "rush_save_health", "1" ), pSaveHealth );
+    bind_pcvar_num( create_cvar( "rush_save_pos", "0" ), pSavePos );
+    bind_pcvar_num( create_cvar( "rush_rounds", "10"  ), pRounds  );
 
-    bind_pcvar_num( create_cvar( "rush_rounds", "10" ), pRounds );
     /*
         Explanation rush_alive:
             - 0: revives who made most kills. In case of draw, both revive.
@@ -157,12 +164,14 @@ public plugin_init()
             - 3: both revive.
     */
     bind_pcvar_num( create_cvar( "rush_alive", "0", .description="Info on github.com/amxDust/RushDuel-amxx"), pAlive );
+
     DisableHamForward( PreKilled   = RegisterHamPlayer( Ham_Killed, "fw_PlayerKilled_Post", 1 ) ); 
     DisableHamForward( PostKilled  = RegisterHamPlayer( Ham_Killed, "fw_PlayerKilled_Pre",  0 ) ); 
     //DisableHamForward( PlayerThink = RegisterHamPlayer( Ham_Think,  "fw_PlayerThink_Pre",   0 ) );
     DisableHamForward( PlayerTouch = RegisterHamPlayer( Ham_Touch,  "fw_PlayerTouch" ) );
 
-    //PlayerThink = register_forward( FM_PlayerPreThink, "fw_PlayerThink_Pre" );
+    register_logevent( "RoundStart", 2, "1=Round_Start" );
+    register_logevent( "RoundEnd"  , 2, "1=Round_End"   );
 
     OrpheuRegisterHook( OrpheuGetFunction( "PM_Duck" ), "OnPM_Duck" );
     OrpheuRegisterHook( OrpheuGetFunction( "PM_Jump" ), "OnPM_Jump" );
@@ -170,8 +179,11 @@ public plugin_init()
 
     activeZones = CountZones();
 
-    //to_remove
-    canRush = true;
+    #if defined SQL
+        tuple = SQL_MakeDbTuple( host, user, pass, db );
+
+        register_concmd( "amx_rush_reset", "CmdRushReset", ADMIN_FLAG );
+    #endif
 }
 
 public plugin_precache()
@@ -187,6 +199,29 @@ public client_disconnected( id )
     if( check_bit( bIsInRush, id ) )
         StopDuelPre( GetZone( id ), false, id );
     
+}
+
+public RoundStart()
+{
+    set_task( 2.0, "AllowRush" );
+}
+
+public AllowRush()
+{
+    canRush = true;
+}
+
+public RoundEnd()
+{
+    if( busyZones )
+    {
+        for( new i; i < activeZones; i++ )
+        {
+            if( check_bit( bIsZoneBusy, i ) && !check_bit( bIsOver, i ) )
+                StopDuelPre( i );
+        }
+    }
+    canRush = false;
 }
 
 public AdminRush( id, level, cid )
@@ -461,12 +496,20 @@ GetReady( id, pid, type )
 
     set_bit( bIsZoneBusy, i );
     busyZones++;
-
-    pev( id,  pev_health, g_HealthCache[ i ][ PLAYER1 ] );
-    pev( pid, pev_health, g_HealthCache[ i ][ PLAYER2 ] );
-
+    if( pSaveHealth )
+    {
+        pev( id,  pev_health, g_HealthCache[ i ][ PLAYER1 ] );
+        pev( pid, pev_health, g_HealthCache[ i ][ PLAYER2 ] );
+    }
+    
     set_pev( id,  pev_health, pHealth[ type ] );
     set_pev( pid, pev_health, pHealth[ type ] );
+    
+    if( pSavePos )
+    {
+        pev( id,  pev_origin, g_Position[ i ][ PLAYER1 ] );
+        pev( pid, pev_origin, g_Position[ i ][ PLAYER2 ] );
+    }
     
     TeleportPlayer( id,  i, PLAYER1 );
     TeleportPlayer( pid, i, PLAYER2 );
@@ -736,9 +779,6 @@ public fw_PlayerKilled_Post( victim, killer )
 
         if( task_exists( zone + TASK_AUTOKILL ) )
             remove_task( zone + TASK_AUTOKILL );
-        
-        if( check_bit( bIsOver, zone ) )
-            return;
 
         if( victim != killer )
         {
@@ -747,6 +787,9 @@ public fw_PlayerKilled_Post( victim, killer )
             client_print_color( killer, print_team_red, "%s You won this round. [ %d / %d ]", PREFIX, g_Rounds[ 1 - pos ], pRounds );
         }
         
+        if( check_bit( bIsOver, zone ) )
+            return;
+
         if( g_Rounds[ zone ][ TOTAL ] <= pRounds )
         {
             client_print_color( victim, print_team_red, "%s You lost this round. [ %d / %d ]", PREFIX, g_Rounds[ pos ], pRounds );
@@ -791,17 +834,18 @@ StopDuelPre( zone, bool:isOver = true, id = 0 )
     new p2 = g_RushInfo[ zone ][ PLAYER2 ];
     new r1 = g_Rounds[ zone ][ PLAYER1 ];
     new r2 = g_Rounds[ zone ][ PLAYER2 ];
+
+    if( task_exists( zone + TASK_RESTART ) )
+        remove_task( zone + TASK_RESTART );
+
+    if( task_exists( zone + TASK_AUTOKILL ) )
+        remove_task( zone + TASK_AUTOKILL );
+
+    if( task_exists( zone + TASK_COUNTDOWN ) )
+        remove_task( zone + TASK_COUNTDOWN );
+
     if( !isOver )
-    {
-        if( task_exists( zone + TASK_RESTART ) )
-            remove_task( zone + TASK_RESTART );
-
-        if( task_exists( zone + TASK_AUTOKILL ) )
-            remove_task( zone + TASK_AUTOKILL );
-
-        if( task_exists( zone + TASK_COUNTDOWN ) )
-            remove_task( zone + TASK_COUNTDOWN );
-        
+    {   
         if( is_user_connected( id ) )
         {   
             user_silentkill( id, 0 );
@@ -897,18 +941,18 @@ StopDuelPre( zone, bool:isOver = true, id = 0 )
 
     if( !result )
     {
-        client_print_color( p1, print_team_red, "%s ^4YOU WON AGAINST %n WITH %d/%d ROUNDS.",  PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
-        client_print_color( p2, print_team_red, "%s ^4YOU LOST AGAINST %n WITH %d/%d ROUNDS.", PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
+        client_print_color( p1, print_team_red, "%s YOU ^4WON^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.",  PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
+        client_print_color( p2, print_team_red, "%s YOU ^4LOST^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
     }
     else if( result == 1 )
     {
-        client_print_color( p1, print_team_red, "%s ^4YOU LOST AGAINST %n WITH %d/%d ROUNDS.", PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
-        client_print_color( p2, print_team_red, "%s ^4YOU WON AGAINST %n WITH %d/%d ROUNDS.",  PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
+        client_print_color( p1, print_team_red, "%s YOU ^4LOST^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
+        client_print_color( p2, print_team_red, "%s YOU ^4WON^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.",  PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
     }
     else
     {
-        client_print_color( p1, print_team_red, "%s ^4YOU DRAW AGAINST %n WITH %d/%d ROUNDS.", PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
-        client_print_color( p2, print_team_red, "%s ^4YOU DRAW AGAINST %n WITH %d/%d ROUNDS.", PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
+        client_print_color( p1, print_team_red, "%s YOU ^4DRAW^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
+        client_print_color( p2, print_team_red, "%s YOU ^4DRAW^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
     }
     set_task( 0.9, "StopDuel", zone + TASK_STOP, param, 2 );
     
@@ -919,12 +963,6 @@ public StopDuel( param[], zone )
     zone -= TASK_STOP;
     new p1 = g_RushInfo[ zone ][ PLAYER1 ];
     new p2 = g_RushInfo[ zone ][ PLAYER2 ];
-
-    if( param[ 0 ] && is_user_alive( param[ 0 ] ) )
-        user_silentkill( param[ 0 ], 0 );
-    
-    if( param[ 1 ] && is_user_alive( param[ 1 ] ) )
-        user_silentkill( param[ 1 ], 0 );
 
     clear_bit( bIsInRush, p1 );
     clear_bit( bIsInRush, p2 );
@@ -938,10 +976,31 @@ public StopDuel( param[], zone )
     clear_bit( bIsZoneBusy, zone );
     clear_bit( bHasTouch, zone );
 
-    if( is_user_alive( p1 ) )
-        set_pev( p1, pev_health, g_HealthCache[ zone ][ PLAYER1 ] );
-    if( is_user_alive( p2 ) )
-        set_pev( p2, pev_health, g_HealthCache[ zone ][ PLAYER2 ] );
+    if( canRush )
+    {
+        if( param[ 0 ] && is_user_alive( param[ 0 ] ) )
+            user_silentkill( param[ 0 ], 0 );
+        if( param[ 1 ] && is_user_alive( param[ 1 ] ) )
+            user_silentkill( param[ 1 ], 0 );
+
+        if( is_user_alive( p1 ) )
+        {
+            if( pSaveHealth )
+                set_pev( p1, pev_health, g_HealthCache[ zone ][ PLAYER1 ] );
+            if( pSavePos )
+                set_pev( p1, pev_origin, g_Position[ zone ][ PLAYER1 ] );
+        }
+            
+        if( is_user_alive( p2 ) )
+        {
+            if( pSaveHealth )
+                set_pev( p2, pev_health, g_HealthCache[ zone ][ PLAYER2 ] );
+            if( pSavePos )
+                set_pev( p2, pev_origin, g_Position[ zone ][ PLAYER2 ] );
+        }
+            
+        
+    }
     
     clear_bit( bIsOver, zone );
 }
@@ -1315,3 +1374,59 @@ stock LookAtOrigin(const id, const Float:fOrigin_dest[3])
     set_pev(id, pev_angles, fLook);
     set_pev(id, pev_fixangle, 1);
 }  
+
+#if defined SQL
+    public plugin_cfg()
+    {
+        set_task( 0.1, "SQL_Init" );
+    }
+
+    public plugin_end()
+    {
+        if( bResetRanks )
+            SQL_ThreadQuery( tuple, "IgnoreHandle", "DELETE FROM `rush_duel`;" );
+
+        SQL_FreeHandle( tuple );
+    }
+
+    public CmdRushReset( id, level, cid )
+    {
+        if( !cmd_access( id, level, cid, 0 ) )
+            return PLUGIN_HANDLED;
+        
+        bResetRanks = true;
+        
+        console_print( id, "[RUSH] Ranks will be reset next round!" );
+        
+        return PLUGIN_HANDLED;
+    }
+
+    public SQL_Init()
+    {
+        new query[ 512 ];
+        formatex( query, charsmax( query ), "CREATE TABLE IF NOT EXISTS `rush_duel`(\
+                                                `id` INT NOT NULL AUTO_INCREMENT,\
+                                                `player_name` VARCHAR(31) NOT NULL,\
+                                                `player_steamid` VARCHAR(30) NOT NULL UNIQUE,\
+                                                `duels` INT(5) NOT NULL,\
+                                                `won` INT(5) NOT NULL,\
+                                                `lost` INT(5) NOT NULL,\
+                                                `won_slash` INT(5) NOT NULL,\
+                                                `won_stab` INT(5) NOT NULL,\
+                                                `won_both` int(5) NOT NULL,\
+                                                `eff` decimal(5,2) NOT NULL,\
+                                                `rank_util` INT(6) NOT NULL,\
+                                                PRIMARY KEY (id)\
+                                            );" );
+        
+        SQL_ThreadQuery( tuple, "IgnoreHandle", query );
+    }
+
+    public IgnoreHandle( failState, Handle:query, error[], errNum )
+    {
+        if( errNum )
+            set_fail_state( error );
+        
+        SQL_FreeHandle( query );
+    }
+#endif
