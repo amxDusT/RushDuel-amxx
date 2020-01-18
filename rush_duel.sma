@@ -38,7 +38,7 @@
 #define clear_bit(%1,%2)    (%1 &= ~(1<<(%2&31)))
 #define check_bit(%1,%2)    (%1 & (1<<(%2&31)))
 
-#define VERSION "2.0"
+#define VERSION "2.0.1"
 #define AUTHOR  "DusT"
 
 new const TOTAL = 2;
