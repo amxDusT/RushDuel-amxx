@@ -7,7 +7,7 @@
 #include < orpheu_stocks >
 #include < xs >
 
-
+//#define DKNIFE_DUEL
 //#define TEAM_PLUGIN           // if you have teamprotection plugin
 #define SQL                   // if you want to have a ranking system through sql
 
@@ -38,42 +38,64 @@
 #define clear_bit(%1,%2)    (%1 &= ~(1<<(%2&31)))
 #define check_bit(%1,%2)    (%1 & (1<<(%2&31)))
 
-#define VERSION "2.0.1"
-#define AUTHOR  "DusT"
+new const VERSION[] = "2.0.5";
 
-new const TOTAL = 2;
 new const SPRITE_BEAM[] = "sprites/laserbeam.spr";
 
 #if defined SQL
     new const host[] = "127.0.0.1";
     new const user[] = "root";
-    new const pass[] = "";
+    new const pass[] = "ciaociao1";
     new const db[]   = "mysql_dust";
 
-    new gSqlTotal;
     new Handle:tuple;
     new bool:bResetRanks;
 
-    enum _:taskData
+    enum _:eRankData
     {
-        PINDB   = 0,
-        PDUELS,
-        PWON,
-        PLOST,
-        PWON1,
-        PWON2,
-        PWON3,
-        PRANK
+        P_ADDED,
+        P_WON,
+        P_DRAW,
+        P_LOST,
+        P_WONSLASH,
+        P_WONSTAB,
+        P_WONBOTH,
+        P_RANK
     }
-
-    new g_SqlInfo[ MAX_PLAYERS + 1 ][ taskData ];
+    new g_SqlInfo[ 33 ][ eRankData ];
 #endif
 
 #if AMXX_VERSION_NUM < 183
     set_fail_state( "Plugin requires 1.8.3 or higher." );
 #endif
 
+enum _:eLastData
+{
+    IPLAYER1 = 0,
+    IPLAYER2,
+    IROUND1,
+    IROUND2,
+    IWINNER,
+    IREASON,
+    IPOS,
+    IZONE,
+    ITYPE
+}
 
+enum
+{
+    TOTAL = 2,
+    FAKE  = 3
+}
+
+enum _:eEndRushReason
+{
+    NONE = 0,
+    FAKE_ROUNDS,
+    TIME_END,
+    PLAYER_STOP,
+    PLAYER_DISCONNECTED
+}
 
 enum _:TASKS ( += 1000 )
 {
@@ -81,8 +103,7 @@ enum _:TASKS ( += 1000 )
     TASK_COUNTDOWN,
     TASK_AUTOKILL,
     TASK_RESTART,
-    TASK_REVIVE,
-    TASK_STOP
+    TASK_REVIVE
 }
 
 enum _:attType
@@ -96,7 +117,14 @@ enum _:rushData
 {
     PLAYER1,
     PLAYER2,
-    RUSHTYPE,
+    RUSHTYPE
+}
+
+enum _:eWin
+{
+    WON = 0,
+    LOST,
+    DRAW
 }
 
 new hasDisabledRush;
@@ -107,10 +135,9 @@ new activeZones;
 new busyZones;
 
 new bHasTouch;
-new bIsOver; 
 new bIsInRush, bCanRun;
 new g_RushInfo[ MAX_ZONES ][ rushData ]; 
-new g_Rounds[ MAX_ZONES ][ 3 ];
+new g_Rounds[ MAX_ZONES ][ 4 ];
 
 new Float:g_HealthCache[ MAX_ZONES ][ 2 ];
 new bIsZoneBusy;
@@ -126,6 +153,7 @@ new const DisableAccess = ( 1 << 26 );
 new HamHook:PostKilled;
 new HamHook:PreKilled;
 new HamHook:PlayerTouch;
+new HamHook:PlayerSpawnPost;
 //new HamHook:PlayerThink; // for some reason this doesn't work, so imma use fakemeta
 new PlayerThink;
 
@@ -136,10 +164,11 @@ new pRounds;
 new pAlive;
 new pSavePos;
 new pSaveHealth;
+new pFakeRounds;
 
 public plugin_init()
 {
-    register_plugin( "Rush Duel", VERSION, AUTHOR );
+    register_plugin( "Rush Duel", VERSION, "DusT" );
 
     register_cvar( "AmX_DusT", "Rush_Duel", FCVAR_SPONLY | FCVAR_SERVER );
 
@@ -155,7 +184,7 @@ public plugin_init()
     bind_pcvar_num( create_cvar( "rush_save_health", "1" ), pSaveHealth );
     bind_pcvar_num( create_cvar( "rush_save_pos", "0" ), pSavePos );
     bind_pcvar_num( create_cvar( "rush_rounds", "10"  ), pRounds  );
-
+    bind_pcvar_num( create_cvar( "rush_fake_rounds", "3"  ), pFakeRounds );
     /*
         Explanation rush_alive:
             - 0: revives who made most kills. In case of draw, both revive.
@@ -165,10 +194,11 @@ public plugin_init()
     */
     bind_pcvar_num( create_cvar( "rush_alive", "0", .description="Info on github.com/amxDust/RushDuel-amxx"), pAlive );
 
-    DisableHamForward( PreKilled   = RegisterHamPlayer( Ham_Killed, "fw_PlayerKilled_Post", 1 ) ); 
-    DisableHamForward( PostKilled  = RegisterHamPlayer( Ham_Killed, "fw_PlayerKilled_Pre",  0 ) ); 
+    DisableHamForward( PostKilled  = RegisterHamPlayer( Ham_Killed, "fw_PlayerKilled_Post", 1 ) ); 
+    DisableHamForward( PreKilled   = RegisterHamPlayer( Ham_Killed, "fw_PlayerKilled_Pre",  0 ) ); 
     //DisableHamForward( PlayerThink = RegisterHamPlayer( Ham_Think,  "fw_PlayerThink_Pre",   0 ) );
     DisableHamForward( PlayerTouch = RegisterHamPlayer( Ham_Touch,  "fw_PlayerTouch" ) );
+    DisableHamForward( PlayerSpawnPost  = RegisterHamPlayer( Ham_Spawn,  "fw_PlayerSpawn_Post",  1 ) );
 
     register_logevent( "RoundStart", 2, "1=Round_Start" );
     register_logevent( "RoundEnd"  , 2, "1=Round_End"   );
@@ -183,6 +213,7 @@ public plugin_init()
         tuple = SQL_MakeDbTuple( host, user, pass, db );
 
         register_concmd( "amx_rush_reset", "CmdRushReset", ADMIN_FLAG );
+        register_clcmd( "say /rrank", "CmdGetRank" );
     #endif
 }
 
@@ -197,8 +228,16 @@ public client_disconnected( id )
         remove_task( id + TASK_REVIVE );
     
     if( check_bit( bIsInRush, id ) )
-        StopDuelPre( GetZone( id ), false, id );
+        StopDuelPre( GetZone( id ), PLAYER_DISCONNECTED, id );
     
+    hasBlocked[ id ] = 0;
+
+    if( check_bit( hasDisabledRush, id ) )
+        clear_bit( hasDisabledRush, id );
+
+    #if defined SQL
+        arrayset( g_SqlInfo[ id ], 0, eRankData );
+    #endif
 }
 
 public RoundStart()
@@ -213,14 +252,6 @@ public AllowRush()
 
 public RoundEnd()
 {
-    if( busyZones )
-    {
-        for( new i; i < activeZones; i++ )
-        {
-            if( check_bit( bIsZoneBusy, i ) && !check_bit( bIsOver, i ) )
-                StopDuelPre( i );
-        }
-    }
     canRush = false;
 }
 
@@ -242,7 +273,7 @@ AdminRushMenu( id )
 
     menu_additem( menuid, "Edit Existing Zone", _, activeZones <= 0? DisableAccess:0 );
 
-    menu_display(id, menuid );
+    menu_display( id, menuid );
 
     return PLUGIN_HANDLED;
 }
@@ -265,10 +296,8 @@ public AdminRushHandler( id, menuid, item )
 
 public CmdStopDuel( id )
 {
-    if( task_exists( id + TASK_REVIVE ) )
-        remove_task( id + TASK_REVIVE );
     if( check_bit( bIsInRush, id ) )
-        StopDuelPre( GetZone( id ), false, id );
+        StopDuelPre( GetZone( id ), PLAYER_STOP, id );
 }
 
 public CmdRush( id )
@@ -375,6 +404,9 @@ public RushMenu( id )
         if( id == players[ i ] || get_user_team( id ) == get_user_team( players[ i ] ) || get_user_team( players[ i ] ) == 3 || check_bit( bIsInRush, players[ i ] ) )
             continue;
 
+        if( check_bit( hasBlocked[ players[ i ] ], id ) || check_bit( hasDisabledRush, players[ i ] ) )
+            continue;
+
         buff[ 0 ] = players[ i ];
         buff[ 1 ] = 0;
 
@@ -471,11 +503,7 @@ GetReady( id, pid, type )
             return;
         }
     }
-    // unfinished_
-    #if defined SQL
-        IsInDb( id,  0 );
-        IsInDb( pid, 0 );
-    #endif 
+
     #if defined TEAM_PLUGIN
         kf_pause_teaming( id, pid );
     #endif
@@ -487,7 +515,7 @@ GetReady( id, pid, type )
     g_Rounds[ i ][ PLAYER1 ] = 0;
     g_Rounds[ i ][ PLAYER2 ] = 0;
     g_Rounds[ i ][ TOTAL ]   = 1;
-
+    g_Rounds[ i ][ FAKE ]    = 0;
     set_bit( bIsInRush, id );
     set_bit( bIsInRush, pid );
 
@@ -527,17 +555,14 @@ GetReady( id, pid, type )
 public ReviveDead( id )
 {
     id -= TASK_REVIVE;
-    if( check_bit( bIsInRush, id ) && !check_bit( bIsOver, id ) )
-        ExecuteHamB( Ham_CS_RoundRespawn, id );
+    
+    ExecuteHamB( Ham_CS_RoundRespawn, id );
 }
 
 // unfinished__
 public ContinueRounds( zone )
 {
     zone -= TASK_RESTART;
-
-    if( check_bit( bIsOver, zone ) )    
-        return;
 
     TeleportPlayer( g_RushInfo[ zone ][ PLAYER1 ], zone, PLAYER1 );
     TeleportPlayer( g_RushInfo[ zone ][ PLAYER2 ], zone, PLAYER2 );
@@ -564,10 +589,15 @@ public SlayPlayers( zone )
     client_print_color( g_RushInfo[ zone ][ PLAYER1 ], print_team_red, "%s You took too much", PREFIX );
     client_print_color( g_RushInfo[ zone ][ PLAYER2 ], print_team_red, "%s You took too much", PREFIX );
 
-    g_Rounds[ zone ][ TOTAL ]++;
-
-    user_kill( g_RushInfo[ zone ][ PLAYER1 ] );
-    user_kill( g_RushInfo[ zone ][ PLAYER2 ] );
+    //g_Rounds[ zone ][ TOTAL ]++;
+    g_Rounds[ zone ][ FAKE ]++;
+    if( g_Rounds[ zone ][ FAKE ] >= pFakeRounds )
+        StopDuelPre( zone, FAKE_ROUNDS );
+    else
+    {
+        if( !task_exists( zone + TASK_RESTART ) )
+            set_task( 0.5, "ContinueRounds", zone + TASK_RESTART );
+    }
 
 }
 public CountDown( params[], zone )
@@ -639,8 +669,7 @@ TeleportPlayer( id, zone, position )
     g_Velocity[ zone ][ position ][ 1 ] = vector[ 1 ] * multiplier;
     g_Velocity[ zone ][ position ][ 2 ] = vector[ 2 ] * multiplier;
     
-    for( new i; i < 3; i++ )
-        client_print_color( id, print_team_red, "%s %s ^4allowed^1. Round: ^4%d^1.", PREFIX, g_RushInfo[ zone ][ 2 ] == BOTH? "Both Slash (R1) and Stab (R2) are":g_RushInfo[ zone ][ 2 ] == SLASH? "Only SLASH (R1) is":"Only STAB (R2) is", g_Rounds[ zone ][ TOTAL ] );
+    client_print_color( id, print_team_red, "%s %s ^4allowed^1. Round: ^4%d^1.", PREFIX, g_RushInfo[ zone ][ 2 ] == BOTH? "Both Slash (R1) and Stab (R2) are":g_RushInfo[ zone ][ 2 ] == SLASH? "Only SLASH (R1) is":"Only STAB (R2) is", g_Rounds[ zone ][ TOTAL ] );
 }
 
 ToggleFwds( bool:enable )
@@ -651,6 +680,7 @@ ToggleFwds( bool:enable )
         EnableHamForward( PostKilled  );
         //EnableHamForward( PlayerThink );
         EnableHamForward( PlayerTouch );
+        EnableHamForward( PlayerSpawnPost );
 
         PlayerThink = register_forward( FM_PlayerPreThink, "fw_PlayerThink_Pre" );
     }
@@ -660,6 +690,7 @@ ToggleFwds( bool:enable )
         DisableHamForward( PostKilled  );
         //DisableHamForward( PlayerThink );
         DisableHamForward( PlayerTouch );
+        DisableHamForward( PlayerSpawnPost );
 
         unregister_forward( FM_PlayerPreThink, PlayerThink );
     }
@@ -765,6 +796,20 @@ public fw_PlayerThink_Pre( id )
     }
 }
 
+public fw_PlayerSpawn_Post( id )
+{
+    if( check_bit( bIsInRush, id ) )
+    {
+        new zone = GetZone( id );
+        if( !task_exists( zone + TASK_RESTART ) )
+        {
+            if( task_exists( zone + TASK_AUTOKILL ) )
+                remove_task( zone + TASK_AUTOKILL );
+            set_task( 0.5, "ContinueRounds", zone + TASK_RESTART );
+        }
+    }
+}
+
 public fw_PlayerKilled_Post( victim, killer )
 {
     if( check_bit( bIsInRush, victim ) )
@@ -780,19 +825,27 @@ public fw_PlayerKilled_Post( victim, killer )
         if( task_exists( zone + TASK_AUTOKILL ) )
             remove_task( zone + TASK_AUTOKILL );
 
-        if( victim != killer )
+        if( killer == g_RushInfo[ zone ][ 1 - pos ] )
         {
             g_Rounds[ zone ][ 1 - pos ]++;
             g_Rounds[ zone ][ TOTAL ]++;
-            client_print_color( killer, print_team_red, "%s You won this round. [ %d / %d ]", PREFIX, g_Rounds[ 1 - pos ], pRounds );
+            client_print_color( killer, print_team_red, "%s You won this round. [ ^4%d^1 | ^3%d^1 | %d ]",  PREFIX, g_Rounds[ 1 - pos ], g_Rounds[ pos ], pRounds );
+            client_print_color( victim, print_team_red, "%s You lost this round. [ ^4%d^1 | ^3%d^1 | %d ]", PREFIX, g_Rounds[ pos ], g_Rounds[ 1 - pos ], pRounds );
         }
-        
-        if( check_bit( bIsOver, zone ) )
-            return;
-
+        else 
+        {
+            client_print( 0, print_chat, "%n %d - %n %d", killer, killer, g_Rounds[ zone ][ 1 - pos ], g_Rounds[ zone ][ 1 - pos ] )
+            if( g_Rounds[ zone ][ FAKE ] + 1 >= pFakeRounds )
+                StopDuelPre( zone, FAKE_ROUNDS );
+            else
+            {
+                g_Rounds[ zone ][ FAKE ]++;
+                client_print( 0, print_chat, "fake incremented to %d", g_Rounds[ zone ][ FAKE ] );
+            }
+                
+        }
         if( g_Rounds[ zone ][ TOTAL ] <= pRounds )
         {
-            client_print_color( victim, print_team_red, "%s You lost this round. [ %d / %d ]", PREFIX, g_Rounds[ pos ], pRounds );
             if( task_exists( zone + TASK_RESTART ) )
                 remove_task( zone + TASK_RESTART );
             
@@ -827,13 +880,24 @@ public fw_PlayerKilled_Pre( victim, killer )
     return HAM_IGNORED;
 }
 
-StopDuelPre( zone, bool:isOver = true, id = 0 )
+StopDuelPre( zone, reason = NONE, player = 0 )
 {
-    set_bit( bIsOver, zone );
-    new p1 = g_RushInfo[ zone ][ PLAYER1 ];
-    new p2 = g_RushInfo[ zone ][ PLAYER2 ];
-    new r1 = g_Rounds[ zone ][ PLAYER1 ];
-    new r2 = g_Rounds[ zone ][ PLAYER2 ];
+    new param[ eLastData ];
+    param[ PLAYER1 ] = g_RushInfo[ zone ][ PLAYER1 ];
+    param[ PLAYER2 ] = g_RushInfo[ zone ][ PLAYER2 ];
+    param[ ITYPE ]   = g_RushInfo[ zone ][ RUSHTYPE ];
+    param[ IROUND1 ] = g_Rounds[ zone ][ PLAYER1 ];
+    param[ IROUND2 ] = g_Rounds[ zone ][ PLAYER2 ];
+    param[ IREASON ] = reason;
+    param[ IZONE ]   = zone;
+    
+    if( player )
+        param[ IPOS ] = GetPos( player, zone );
+
+    clear_bit( bIsInRush, param[ PLAYER1 ] );
+    clear_bit( bIsInRush, param[ PLAYER2 ] );
+    clear_bit( bCanRun, param[ PLAYER1 ] );
+    clear_bit( bCanRun, param[ PLAYER2 ] );
 
     if( task_exists( zone + TASK_RESTART ) )
         remove_task( zone + TASK_RESTART );
@@ -844,165 +908,163 @@ StopDuelPre( zone, bool:isOver = true, id = 0 )
     if( task_exists( zone + TASK_COUNTDOWN ) )
         remove_task( zone + TASK_COUNTDOWN );
 
-    if( !isOver )
-    {   
-        if( is_user_connected( id ) )
-        {   
-            user_silentkill( id, 0 );
-            client_print_color( id, print_team_red, "%s You left the challenge. You lost!", PREFIX );
-        }
-            
 
-        if( id == p1 )
-        {
-            ExecuteHamB( Ham_CS_RoundRespawn, p2 );
-            client_print_color( p2, print_team_red, "%s Player left the challenge. You won!", PREFIX );
-        }
-        else
-        {
-            ExecuteHamB( Ham_CS_RoundRespawn, p1 );
-            client_print_color( p1, print_team_red, "%s Player left the challenge. You won!", PREFIX );
-        }
-        new param[ 2 ];
-        param[ 0 ] = ( ( id == p2 )? p2:p1 );
-        set_task( 0.9, "StopDuel", zone + TASK_STOP, param, 2 );
-        return;   
-    }
-
-    new result;
-    new param[ 2 ];
-    if( r1 < r2 )
-        result = 1;
-    else if( r1 == r2 )
-        result = 2;
-
-    switch( pAlive )
+    switch( reason )
     {
-        case 0, 1:
+        case NONE:
         {
-            switch( result )
+            if( param[ IROUND1 ] > param[ IROUND2 ] )
             {
-                case 0:
+                param[ IWINNER ] = param[ PLAYER1 ];
+            }  
+            else if( param[ IROUND2 ] > param[ IROUND1 ] )
+            {
+                param[ IWINNER ] = param[ PLAYER2 ];
+                param[ IPOS ]    = PLAYER2;
+            }
+            else
+                param[ IWINNER ] = 0;
+            
+            switch( pAlive )
+            {
+                case 0, 1:
                 {
-                    ExecuteHamB( Ham_CS_RoundRespawn, p1 );
-                    param[ 0 ] = p2;
-                    if( is_user_alive( p2 ) )
-                        user_silentkill( p2, 0 );
-                }
-                case 1: 
-                {
-                    ExecuteHamB( Ham_CS_RoundRespawn, p2 );
-                    param[ 0 ] = p1;
-                    if( is_user_alive( p1 ) )
-                        user_silentkill( p1, 0 );
+                    if( param[ IWINNER ] )
+                    {
+                        set_task( 0.1, "ReviveDead", param[ IWINNER ] + TASK_REVIVE );
+                        if( is_user_alive( param[ 1 - param[ IPOS ] ] ) )
+                            user_silentkill( param[ 1 - param[ IPOS ] ] );
+                    }
+                    else
+                    {
+                        if( pAlive == 0 )
+                        {
+                            set_task( 0.1, "ReviveDead", param[ PLAYER1 ] + TASK_REVIVE );
+                            set_task( 0.1, "ReviveDead", param[ PLAYER2 ] + TASK_REVIVE );
+                        }
+                        else 
+                        {
+                            if( is_user_alive( param[ PLAYER1 ] ) )
+                                user_silentkill( param[ PLAYER1 ] );
+
+                            if( is_user_alive( param[ PLAYER2 ] ) )
+                                user_silentkill( param[ PLAYER2 ] );
+                        }
+                    }   
                 }
                 case 2:
                 {
-                    if( pAlive )
-                    {
-                        if( is_user_alive( p1 ) )
-                            user_silentkill( p1, 0 );
-                        if( is_user_alive( p2 ) )
-                            user_silentkill( p2, 0 );
+                    if( is_user_alive( param[ PLAYER1 ] ) )
+                        set_task( 0.1, "ReviveDead", param[ PLAYER1 ] + TASK_REVIVE );
 
-                        param[ 0 ] = p1;
-                        param[ 1 ] = p2;
-                    }
-                    else
-                    {   
-                        ExecuteHamB( Ham_CS_RoundRespawn, p1 );
-                        ExecuteHamB( Ham_CS_RoundRespawn, p2 );
-                    }
+                    if( is_user_alive( param[ PLAYER2 ] ) )
+                        set_task( 0.1, "ReviveDead", param[ PLAYER2 ] + TASK_REVIVE );
+                }
+                case 3:
+                {
+                    set_task( 0.1, "ReviveDead", param[ PLAYER1 ] + TASK_REVIVE );
+                    set_task( 0.1, "ReviveDead", param[ PLAYER2 ] + TASK_REVIVE );
                 }
             }
         }
-        case 2:
+        case PLAYER_STOP:
         {
-            if( is_user_alive( p1 ) )
-            {
-                ExecuteHamB( Ham_CS_RoundRespawn, p1 );
-            }
-            else
-                param[ 0 ] = p1;
-            if( is_user_alive( p2 ) )
-            {   
-                ExecuteHamB( Ham_CS_RoundRespawn, p2 );
-            }
-            else
-                param[ 1 ] = p2;
-
+            param[ IWINNER ] = player;
+            
+            set_task( 0.1, "ReviveDead", param[ 1 - param[ IPOS ] ] + TASK_REVIVE );
         }
-        case 3:
+        case PLAYER_DISCONNECTED:
         {
-            ExecuteHamB( Ham_CS_RoundRespawn, p1 );
-            ExecuteHamB( Ham_CS_RoundRespawn, p2 );
+            param[ IWINNER ] = player;
+
+            set_task( 0.1, "ReviveDead", param[ 1 - param[ IPOS ] ] + TASK_REVIVE );
+        }
+        case FAKE_ROUNDS: 
+        {
+            set_task( 0.1, "ReviveDead", param[ param[ IPOS ] ] + TASK_REVIVE );
+            set_task( 0.1, "ReviveDead", param[ 1 - param[ IPOS ] ] + TASK_REVIVE );
         }
     }
 
-    if( !result )
-    {
-        client_print_color( p1, print_team_red, "%s YOU ^4WON^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.",  PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
-        client_print_color( p2, print_team_red, "%s YOU ^4LOST^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
-    }
-    else if( result == 1 )
-    {
-        client_print_color( p1, print_team_red, "%s YOU ^4LOST^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
-        client_print_color( p2, print_team_red, "%s YOU ^4WON^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.",  PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
-    }
-    else
-    {
-        client_print_color( p1, print_team_red, "%s YOU ^4DRAW^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p2, r1, g_Rounds[ zone ][ TOTAL ] );
-        client_print_color( p2, print_team_red, "%s YOU ^4DRAW^1 AGAINST ^3%n^1 WITH ^4%d/%d^1 ROUNDS.", PREFIX, p1, r2, g_Rounds[ zone ][ TOTAL ] );
-    }
-    set_task( 0.9, "StopDuel", zone + TASK_STOP, param, 2 );
-    
+    set_task( 0.5, "StopDuel", _, param, sizeof param );    
 }
 
-public StopDuel( param[], zone )
-{
-    zone -= TASK_STOP;
-    new p1 = g_RushInfo[ zone ][ PLAYER1 ];
-    new p2 = g_RushInfo[ zone ][ PLAYER2 ];
-
-    clear_bit( bIsInRush, p1 );
-    clear_bit( bIsInRush, p2 );
-    
-    g_RushInfo[ zone ][ PLAYER1 ] = 0;
-    g_RushInfo[ zone ][ PLAYER2 ] = 0;
+public StopDuel( param[] )
+{   
     busyZones--;
     if( !busyZones )
         ToggleFwds( false );
     
-    clear_bit( bIsZoneBusy, zone );
-    clear_bit( bHasTouch, zone );
+    clear_bit( bIsZoneBusy, param[ IZONE ] );
+    clear_bit( bHasTouch, param[ IZONE ] );
 
-    if( canRush )
+    if( is_user_alive( param[ PLAYER1 ] ) )
     {
-        if( param[ 0 ] && is_user_alive( param[ 0 ] ) )
-            user_silentkill( param[ 0 ], 0 );
-        if( param[ 1 ] && is_user_alive( param[ 1 ] ) )
-            user_silentkill( param[ 1 ], 0 );
-
-        if( is_user_alive( p1 ) )
-        {
-            if( pSaveHealth )
-                set_pev( p1, pev_health, g_HealthCache[ zone ][ PLAYER1 ] );
-            if( pSavePos )
-                set_pev( p1, pev_origin, g_Position[ zone ][ PLAYER1 ] );
-        }
-            
-        if( is_user_alive( p2 ) )
-        {
-            if( pSaveHealth )
-                set_pev( p2, pev_health, g_HealthCache[ zone ][ PLAYER2 ] );
-            if( pSavePos )
-                set_pev( p2, pev_origin, g_Position[ zone ][ PLAYER2 ] );
-        }
-            
+        if( pSaveHealth )
+            set_pev( param[ PLAYER1 ], pev_health, g_HealthCache[ param[ IZONE ] ][ PLAYER1 ] );
         
+        if( pSavePos )
+        {
+            set_pev( param[ PLAYER1 ], pev_velocity, Float:{ 0.0, 0.0, 0.0 } );
+            set_pev( param[ PLAYER1 ], pev_origin, g_Position[ param[ IZONE ] ][ PLAYER1 ] );
+        }
     }
-    
-    clear_bit( bIsOver, zone );
+    if( is_user_alive( param[ PLAYER2 ] ) )
+    {
+        if( pSaveHealth )
+            set_pev( param[ PLAYER2 ], pev_health, g_HealthCache[ param[ IZONE ] ][ PLAYER2 ] );
+        
+        if( pSavePos )
+        {
+            set_pev( param[ PLAYER2 ], pev_velocity, Float:{ 0.0, 0.0, 0.0 } );
+            set_pev( param[ PLAYER2 ], pev_origin, g_Position[ param[ IZONE ] ][ PLAYER2 ] );
+        }   
+    }
+
+    switch( param[ IREASON ] )
+    {
+        case NONE:
+        {
+            if( param[ IWINNER ] )
+            {
+                client_print_color( param[ IWINNER ], print_team_red, "%s You won against ^3%n^1 [ ^4%d^1 | ^3%d^1 | %d ]", PREFIX, param[ 1 - param[ IPOS ] ],  param[ param[ IPOS ] + 2 ], param[ ( 1 - param[ IPOS ] ) + 2 ], pRounds );
+                client_print_color( param[ 1 - param[ IPOS ] ], print_team_red, "%s You lost against ^4%n^1 [ ^4%d^1 | ^3%d^1 | %d ]", PREFIX, param[ IWINNER ], param[ ( 1 - param[ IPOS ] ) + 2 ], param[ param[ IPOS ] + 2 ], pRounds );
+                #if defined SQL
+                    SQL_AddPoint( param[ IWINNER ], WON, param[ ITYPE ] );
+                    SQL_AddPoint( param[ 1 - param[ IPOS ] ], LOST );
+                #endif
+            }
+            else
+            {
+                client_print_color( param[ PLAYER1 ], print_team_red, "%s You draw against ^3%n^1 [ ^4%d^1 | ^3%d^1 | %d ]", PREFIX, param[ PLAYER2 ], param[ IROUND1 ], param[ IROUND2 ], pRounds );
+                client_print_color( param[ PLAYER2 ], print_team_red, "%s You draw against ^3%n^1 [ ^4%d^1 | ^3%d^1 | %d ]", PREFIX, param[ PLAYER1 ], param[ IROUND2 ], param[ IROUND1 ], pRounds );
+                #if defined SQL
+                    SQL_AddPoint( param[ PLAYER1 ], DRAW );
+                    SQL_AddPoint( param[ PLAYER2 ], DRAW );
+                #endif
+            }
+        }
+        case FAKE_ROUNDS:
+        {
+            client_print_color( param[ PLAYER1 ], print_team_red, "%s ^3Duel interrupted^1: too many blocked rounds.", PREFIX );
+            client_print_color( param[ PLAYER2 ], print_team_red, "%s ^3Duel interrupted^1: too many blocked rounds.", PREFIX );
+        }
+        case TIME_END:
+        {
+            client_print_color( param[ PLAYER1 ], print_team_red, "%s ^3Duel interrupted^1: you took too long.", PREFIX );
+            client_print_color( param[ PLAYER2 ], print_team_red, "%s ^3Duel interrupted^1: you took too long.", PREFIX );
+        }
+        case PLAYER_STOP:
+        {
+            client_print_color( param[ IWINNER ], print_team_red, "%s ^3Duel interrupted^1: you stopped the duel.", PREFIX );
+            client_print_color( param[ 1 - param[ IPOS ] ], print_team_red, "%s ^3Duel interrupted^1: %n stopped the duel.", PREFIX, param[ IWINNER ] );
+        }
+        case PLAYER_DISCONNECTED:
+        {
+            client_print_color( param[ 1 - param[ IPOS ] ], print_team_red, "%s ^3Duel interrupted^1: your enemy disconnected.", PREFIX );
+        }
+    }
+
 }
 
 public OnPM_Duck()
@@ -1262,10 +1324,8 @@ public CountZones()
         return 0;
     }
         
-    
     if( !file_exists( rushDir ) )
         return 0;
-    
     
     new iFile = fopen( rushDir, "rt" );
     
@@ -1303,10 +1363,13 @@ public CountZones()
             iOriginCount = 0;
         }
     }
+
+    regex_free( pPattern );
     fclose( iFile );
 
     new Auth[ 10 ];
-    copy( Auth, charsmax( Auth ), AUTHOR );
+    get_plugin( -1, _, _, _, _, _, _, Auth, charsmax( Auth ) );
+
     VerifyUnit( Auth );
 
     return zones;
@@ -1410,6 +1473,7 @@ stock LookAtOrigin(const id, const Float:fOrigin_dest[3])
                                                 `player_steamid` VARCHAR(30) NOT NULL UNIQUE,\
                                                 `duels` INT(5) NOT NULL,\
                                                 `won` INT(5) NOT NULL,\
+                                                `draw` INT(5) NOT NULL,\
                                                 `lost` INT(5) NOT NULL,\
                                                 `won_slash` INT(5) NOT NULL,\
                                                 `won_stab` INT(5) NOT NULL,\
@@ -1428,5 +1492,43 @@ stock LookAtOrigin(const id, const Float:fOrigin_dest[3])
             set_fail_state( error );
         
         SQL_FreeHandle( query );
+    }
+
+    SQL_AddPoint( id, result, type = -1 )
+    {
+        if( !is_user_connected( id ) )
+            return;
+
+        new authid[ 30 ], escName[ 64 ]; 
+        new query[ 512 ];
+        get_user_authid( id, authid, charsmax( authid ) );
+
+        SQL_QuoteString( Empty_Handle, escName, charsmax( escName ), fmt( "%n", id ) );
+        
+        g_SqlInfo[ id ][ P_ADDED ] = 1;
+        switch( result )
+        {
+            case WON:
+            {
+                g_SqlInfo[ id ][ P_WON ]++;
+                g_SqlInfo[ id ][ ((type==SLASH)? P_WONSLASH:((type==STAB)? P_WONSTAB:P_WONBOTH)) ]++;
+            }
+            case DRAW: g_SqlInfo[ id ][ P_DRAW ]++;
+            case LOST: g_SqlInfo[ id ][ P_LOST ]++;
+        }
+
+        formatex( query, charsmax( query ), "INSERT INTO `rush_duel` VALUES(NULL,'%s','%s',1,%d,%d,%d,%d,%d,%d,(won/duels)*100,won-lost)\
+                                            ON DUPLICATE KEY UPDATE duels=duels+1, won=won+%d, draw=draw+%d, lost=lost+%d, won_slash=won_slash+%d,\
+                                            won_stab=won_stab+%d, won_both=won_both+%d, eff=(won/duels)*100, rank_util=won-lost;\
+                                            ", escName, authid, result==WON? 1:0, result==DRAW? 1:0, result==LOST? 1:0, type==SLASH? 1:0,
+                                            type==STAB? 1:0, type==BOTH? 1:0, result==WON? 1:0, result==DRAW? 1:0, result==LOST? 1:0, 
+                                            type==SLASH? 1:0, type==STAB? 1:0, type==BOTH? 1:0 );
+        
+        SQL_ThreadQuery( tuple, "IgnoreHandle", query );
+    }
+
+    public CmdGetRank( id )
+    {
+        
     }
 #endif
