@@ -38,14 +38,14 @@
 #define clear_bit(%1,%2)    (%1 &= ~(1<<(%2&31)))
 #define check_bit(%1,%2)    (%1 & (1<<(%2&31)))
 
-new const VERSION[] = "2.0.5";
+new const VERSION[] = "2.0.6";
 
 new const SPRITE_BEAM[] = "sprites/laserbeam.spr";
 
 #if defined SQL
     new const host[] = "127.0.0.1";
     new const user[] = "root";
-    new const pass[] = "ciaociao1";
+    new const pass[] = "";
     new const db[]   = "mysql_dust";
 
     new Handle:tuple;
@@ -54,15 +54,18 @@ new const SPRITE_BEAM[] = "sprites/laserbeam.spr";
     enum _:eRankData
     {
         P_ADDED,
+        P_DUELS,
         P_WON,
         P_DRAW,
         P_LOST,
         P_WONSLASH,
         P_WONSTAB,
-        P_WONBOTH,
-        P_RANK
+        P_WONBOTH
     }
     new g_SqlInfo[ 33 ][ eRankData ];
+    new Float:fCheckRank[ 33 ];
+
+    #define COOLDOWN    10.0
 #endif
 
 #if AMXX_VERSION_NUM < 183
@@ -214,6 +217,8 @@ public plugin_init()
 
         register_concmd( "amx_rush_reset", "CmdRushReset", ADMIN_FLAG );
         register_clcmd( "say /rrank", "CmdGetRank" );
+        register_clcmd( "say /rstats", "CmdGetRankStats" );
+        register_clcmd( "say /rtop", "CmdGetTop" );
     #endif
 }
 
@@ -237,6 +242,7 @@ public client_disconnected( id )
 
     #if defined SQL
         arrayset( g_SqlInfo[ id ], 0, eRankData );
+        fCheckRank[ id ] = 0.0;
     #endif
 }
 
@@ -1505,19 +1511,27 @@ stock LookAtOrigin(const id, const Float:fOrigin_dest[3])
 
         SQL_QuoteString( Empty_Handle, escName, charsmax( escName ), fmt( "%n", id ) );
         
-        g_SqlInfo[ id ][ P_ADDED ] = 1;
-        switch( result )
+        if( g_SqlInfo[ id ][ P_ADDED ] )
         {
-            case WON:
+            g_SqlInfo[ id ][ P_DUELS ]++;
+            switch( result )
             {
-                g_SqlInfo[ id ][ P_WON ]++;
-                g_SqlInfo[ id ][ ((type==SLASH)? P_WONSLASH:((type==STAB)? P_WONSTAB:P_WONBOTH)) ]++;
+                case WON:
+                {
+                    g_SqlInfo[ id ][ P_WON ]++;
+                    g_SqlInfo[ id ][ ((type==SLASH)? P_WONSLASH:((type==STAB)? P_WONSTAB:P_WONBOTH)) ]++;
+                }
+                case DRAW: g_SqlInfo[ id ][ P_DRAW ]++;
+                case LOST: g_SqlInfo[ id ][ P_LOST ]++;
             }
-            case DRAW: g_SqlInfo[ id ][ P_DRAW ]++;
-            case LOST: g_SqlInfo[ id ][ P_LOST ]++;
+            formatex( query, charsmax( query ), "UPDATE `rush_duel` SET duels=%s, won=%d, draw=%d, lost=%d, won_slash=%d,\
+                                            won_stab=%d, won_both=%d, eff=(won/duels)*100, rank_util=won-lost WHERE\
+                                            player_steamid='%s'", g_SqlInfo[ id ][ P_DUELS ], g_SqlInfo[ id ][ P_WON ], g_SqlInfo[ id ][ P_DRAW ], 
+                                            g_SqlInfo[ id ][ P_LOST ], g_SqlInfo[ id ][ P_WONSLASH ],
+                                            g_SqlInfo[ id ][ P_WONSTAB ], g_SqlInfo[ id ][ P_WONBOTH ], authid );
         }
-
-        formatex( query, charsmax( query ), "INSERT INTO `rush_duel` VALUES(NULL,'%s','%s',1,%d,%d,%d,%d,%d,%d,(won/duels)*100,won-lost)\
+        else 
+            formatex( query, charsmax( query ), "INSERT INTO `rush_duel` VALUES(NULL,'%s','%s',1,%d,%d,%d,%d,%d,%d,(won/duels)*100,won-lost)\
                                             ON DUPLICATE KEY UPDATE duels=duels+1, won=won+%d, draw=draw+%d, lost=lost+%d, won_slash=won_slash+%d,\
                                             won_stab=won_stab+%d, won_both=won_both+%d, eff=(won/duels)*100, rank_util=won-lost;\
                                             ", escName, authid, result==WON? 1:0, result==DRAW? 1:0, result==LOST? 1:0, type==SLASH? 1:0,
@@ -1529,6 +1543,165 @@ stock LookAtOrigin(const id, const Float:fOrigin_dest[3])
 
     public CmdGetRank( id )
     {
+        if( fCheckRank[ id ] + COOLDOWN > get_gametime() )
+        {
+            client_print_color( id, print_team_red, "%s You can't use this command right now. Wait ^3%.2f^1 seconds.", PREFIX, ( fCheckRank[ id ] + COOLDOWN ) - get_gametime() );
+            return PLUGIN_HANDLED;
+        }
+
+        SQL_GetRank( id, 0 );
+
+        return PLUGIN_HANDLED;
         
     }
+
+    public CmdGetRankStats( id )
+    {
+        if( fCheckRank[ id ] + COOLDOWN > get_gametime() )
+        {
+            client_print_color( id, print_team_red, "%s You can't use this command right now. Wait ^3%.2f^1 seconds.", PREFIX, ( fCheckRank[ id ] + COOLDOWN ) - get_gametime() );
+            return PLUGIN_HANDLED;
+        }
+
+        SQL_GetRank( id, 1 );
+
+        return PLUGIN_HANDLED;
+        
+    }
+    SQL_GetRank( id, type )
+    {
+        new iData[ 3 ], query[ 512 ], authid[ 30 ];
+
+        iData[ 0 ] = id;
+        iData[ 2 ] = type;
+        get_user_authid( id, authid, charsmax( authid ) );
+
+        if( g_SqlInfo[ id ][ P_ADDED ] == 1 )
+        {
+            formatex( query, charsmax( query ), "SELECT (SELECT COUNT(*) FROM rush_duel) as rank_total, rank_util AS rnkutil,\
+                                                 eff AS deff, (SELECT COUNT(*) FROM rush_duel WHERE rank_util>rnkutil OR \
+                                                 (rank_util=rnkutil AND eff>=deff)) AS position FROM rush_duel WHERE \
+                                                 player_steamid='%s';", authid );
+        }
+        else 
+        {
+            iData[ 1 ] = 1;
+            formatex( query, charsmax( query ), "SELECT * FROM `rush_duel` WHERE `player_steamid`='%s'", authid );
+        }
+
+        SQL_ThreadQuery( tuple, "GetRank", query, iData, sizeof iData );
+    }
+
+    public GetRank( failState, Handle:query, error[], errNum, iData[] )
+    {
+        if( errNum )
+            set_fail_state( error );
+        
+        new id = iData[ 0 ];
+        if( !is_user_connected( id ) )
+            return;
+
+        if( !SQL_NumResults( query ) )
+        {
+            client_print_color( id, print_team_red, "%s You are unranked.", PREFIX );
+            fCheckRank[ id ] = get_gametime();
+            return;
+        }
+
+        if( iData[ 1 ] )
+        {
+            g_SqlInfo[ id ][ P_ADDED ]      = 1;
+            g_SqlInfo[ id ][ P_DUELS ]      = SQL_ReadResult( query, 3 );
+            g_SqlInfo[ id ][ P_WON ]        = SQL_ReadResult( query, 4 );
+            g_SqlInfo[ id ][ P_DRAW ]       = SQL_ReadResult( query, 5 );
+            g_SqlInfo[ id ][ P_LOST ]       = SQL_ReadResult( query, 6 );
+            g_SqlInfo[ id ][ P_WONSLASH ]   = SQL_ReadResult( query, 7 );
+            g_SqlInfo[ id ][ P_WONSTAB ]    = SQL_ReadResult( query, 8 );
+            g_SqlInfo[ id ][ P_WONBOTH ]    = SQL_ReadResult( query, 9 );
+            SQL_GetRank( id, iData[ 2 ] );
+        }
+        else
+        {
+            new total = SQL_ReadResult( query, SQL_FieldNameToNum( query, "rank_total"  ) );
+            new position = SQL_ReadResult( query, SQL_FieldNameToNum( query, "position" ) );
+            ShowRank( id, position, total, iData[ 2 ] == 1? true:false );
+        }
+
+    }
+    ShowRank( id, position, total, bool:stats = false )
+    {
+        fCheckRank[ id ] = get_gametime();
+        if( !is_user_connected( id ) || !g_SqlInfo[ id ][ P_ADDED ] )
+            return;
+        
+        if( !stats )
+            client_print_color( id, print_team_red, "%s Your rank is %d of %d with %d duel(s), %d win(s), %d loss(es) and %.2f eff", PREFIX, position, 
+                                                total, g_SqlInfo[ id ][ P_DUELS ], g_SqlInfo[ id ][ P_WON ], g_SqlInfo[ id ][ P_LOST ], 
+                                                ( ( Float:g_SqlInfo[ id ][ P_WON ] / Float:g_SqlInfo[ id ][ P_DUELS ] ) * 100 ) );
+        else
+        {
+            new msg[ 512 ], len;
+            len += formatex( msg[ len ], charsmax( msg ), "<meta charset=utf-8><body bgcolor=#000000><font color=#FFB000><pre>" );
+            len += formatex( msg[ len ], charsmax( msg ), "<h3>RUSH DUEL STATS</h3>" );
+            len += formatex( msg[ len ], charsmax( msg ), "Your rank is %d of %d<br><br>", position, total          );
+            len += formatex( msg[ len ], charsmax( msg ), "Duels         : %d<br>", g_SqlInfo[ id ][ P_DUELS ]      );
+            len += formatex( msg[ len ], charsmax( msg ), "Wins          : %d<br>", g_SqlInfo[ id ][ P_WON ]        );
+            len += formatex( msg[ len ], charsmax( msg ), "Wins in Slash : %d<br>", g_SqlInfo[ id ][ P_WONSLASH ]   );
+            len += formatex( msg[ len ], charsmax( msg ), "Wins in Stab  : %d<br>", g_SqlInfo[ id ][ P_WONSTAB ]    );
+            len += formatex( msg[ len ], charsmax( msg ), "Wins in both  : %d<br>", g_SqlInfo[ id ][ P_WONBOTH ]    );
+            len += formatex( msg[ len ], charsmax( msg ), "Draws         : %d<br>", g_SqlInfo[ id ][ P_DRAW ]       );
+            len += formatex( msg[ len ], charsmax( msg ), "Losses        : %d<br>", g_SqlInfo[ id ][ P_LOST ]       );
+            len += formatex( msg[ len ], charsmax( msg ), "Efficacy      : %.2f<br>", ( Float:g_SqlInfo[ id ][ P_WON ] / Float:g_SqlInfo[ id ][ P_DUELS ] ) * 100 );
+            len += formatex( msg[ len ], charsmax( msg ), "</pre><br><br><br><br>" );
+            
+            show_motd( id, msg, fmt( "Rush Duel - %n", id ) );
+        }
+    }
+
+    public CmdGetTop( id )
+    {
+        if( fCheckRank[ id ] + COOLDOWN > get_gametime() )
+        {
+            client_print_color( id, print_team_red, "%s You can't use this command right now. Wait ^3%.2f^1 seconds.", PREFIX, ( fCheckRank[ id ] + COOLDOWN ) - get_gametime() );
+            return PLUGIN_HANDLED;
+        }
+        new data[ 1 ];
+        data[ 0 ] = id;
+        SQL_ThreadQuery( tuple, "GetTop", "SELECT DISTINCT `player_name`, `duels`, `won`, `draw`, `lost` FROM `rush_duel` ORDER BY `rank_util` DESC, `eff` DESC LIMIT 15", data, sizeof data );
+        return PLUGIN_HANDLED;
+    }
+
+    public GetTop( failState, Handle:query, error[], errNum, data[] )
+    {
+        new id = data[ 0 ];
+        if( !is_user_connected( id ) )
+            return;
+        
+        new max = SQL_NumResults( query );
+        if( !max )
+            return; 
+        
+        new top[ 1024 ], len, nick[ 32 ], duels, draws, wins, losses;
+
+        len += formatex( top[ len ], charsmax( top ), "<meta charset=utf-8><body bgcolor=#000000><font color=#FFB000><pre>" );
+        len += formatex( top[ len ], charsmax( top ), "%2s %-22.22s %5s %5s %5s %5s %5s ^n", "#", "Nick", "Duels", "Wins", "Draws", "Losses", "Eff" );
+        
+        for( new i; i < max; i++ )
+        {
+            SQL_ReadResult( query, 0, nick, charsmax( nick ) );
+            replace_all( nick, charsmax( nick ), "<", "[" );
+            replace_all( nick, charsmax( nick ), ">", "]" );
+
+            duels   = SQL_ReadResult( query, 1 );
+            wins    = SQL_ReadResult( query, 2 );
+            draws   = SQL_ReadResult( query, 3 );
+            losses  = SQL_ReadResult( query, 4 );
+
+            len += formatex( top[ len ], charsmax( top ), "%2d %-22.22s %5d %5d %5d %5d %3.2f%%^n", ( i + 1 ), nick, duels, wins, draws, losses, ( Float:wins / Float:duels ) * 100 );
+            SQL_NextRow( query );
+		}
+        len += formatex( top[ len ], charsmax( top ), "</pre>" );
+        show_motd( id, top, "Rush Top" );
+    }
+
 #endif
