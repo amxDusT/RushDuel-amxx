@@ -1,11 +1,7 @@
 # RushDuel-amxx
-Rush Duel for knife
-
-# SQL Doesn't work yet.
-# Unfinished yet. Use at own risk.
+Rush Duel for knife 
  
- 
-Version 2.0.
+Version 2.0.X:
 - Rewritten completely and added rounds. 
 - added rush_health_slash, rush_health_stab, rush_health_both cvars to control HP during these modes
 - added rush_save_health, rush_save_pos: return after a duel with same hp as you had before it and in the same place?
